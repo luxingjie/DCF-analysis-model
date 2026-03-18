@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>A股 DCF 估值分析</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { colors: { brand: { 50:'#f0f9ff',500:'#0ea5e9',600:'#0284c7',700:'#0369a1' } } } }
+    }
+  </script>
+  <style>
+    body { background:#0f172a; font-family:'Inter',system-ui,sans-serif; }
+    .glass { background:rgba(255,255,255,0.04); backdrop-filter:blur(12px); border:1px solid rgba(255,255,255,0.08); }
+    .card-hover { transition:all 0.2s ease; }
+    .card-hover:hover { transform:translateY(-2px); box-shadow:0 12px 32px rgba(14,165,233,0.15); }
+    input[type=range] { accent-color:#0ea5e9; }
+    .spinner { animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .fade-in { animation:fadeIn 0.4s ease; }
+    @keyframes fadeIn { from { opacity:0;transform:translateY(8px); } to { opacity:1;transform:translateY(0); } }
+    ::-webkit-scrollbar{width:6px;} ::-webkit-scrollbar-track{background:#1e293b;} ::-webkit-scrollbar-thumb{background:#334155;border-radius:3px;}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useCallback, useMemo, useEffect, useRef } = React;
+
+const API = 'http://localhost:5001';
+
+/* ─── A股财报预设（单位：元，基于最新年报约估） ─── */
+const PRESETS = {
+  '600519': {
+    name:'贵州茅台', sector:'白酒/消费', beta:0.75,
+    fcf:720e8, netDebt:-2025e8, sharesOut:12.56e8,
+    desc:'中国白酒绝对龙头，茅台酒品牌护城河极深，FCF转化率接近100%。',
+    defaultGrowth:10, defaultWacc:8,
+  },
+  '000858': {
+    name:'五粮液', sector:'白酒/消费', beta:0.85,
+    fcf:240e8, netDebt:-560e8, sharesOut:38.94e8,
+    desc:'中国白酒第二梯队领军，五粮液品牌历史深厚，现金充裕。',
+    defaultGrowth:10, defaultWacc:8.5,
+  },
+  '300750': {
+    name:'宁德时代', sector:'新能源/电池', beta:1.4,
+    fcf:150e8, netDebt:-500e8, sharesOut:22.0e8,
+    desc:'全球最大动力电池供应商，全球份额超35%，深度绑定主流车企。',
+    defaultGrowth:18, defaultWacc:10,
+  },
+  '002594': {
+    name:'比亚迪', sector:'新能源汽车', beta:1.5,
+    fcf:200e8, netDebt:300e8, sharesOut:28.97e8,
+    desc:'全球新能源汽车销量领先，垂直整合从电池到整车，高速扩张期。',
+    defaultGrowth:20, defaultWacc:10.5,
+  },
+  '600036': {
+    name:'招商银行', sector:'银行/金融', beta:0.9,
+    fcf:1465e8, netDebt:0, sharesOut:252.2e8,
+    desc:'中国股份制商业银行龙头，零售银行AUM全国第一，ROE持续领先。',
+    defaultGrowth:8, defaultWacc:9,
+    warning:'银行股 DCF 参考意义有限，建议同时参考 P/B 与 ROE 指标。',
+  },
+  '601318': {
+    name:'中国平安', sector:'保险/金融', beta:1.0,
+    fcf:600e8, netDebt:0, sharesOut:182.8e8,
+    desc:'中国最大综合金融集团，保险、银行、投资三大业务协同。',
+    defaultGrowth:8, defaultWacc:9,
+    warning:'金融股 DCF 参考意义有限，建议同时参考 P/EV 等保险专项指标。',
+  },
+  '600900': {
+    name:'长江电力', sector:'电力/公用事业', beta:0.5,
+    fcf:250e8, netDebt:1800e8, sharesOut:225.1e8,
+    desc:'长江流域水电龙头，装机规模全球最大，现金流极其稳定，类债券属性。',
+    defaultGrowth:5, defaultWacc:7,
+  },
+  '000333': {
+    name:'美的集团', sector:'家电/消费', beta:1.0,
+    fcf:250e8, netDebt:-100e8, sharesOut:131.5e8,
+    desc:'中国最大白电企业，家用空调、冰箱等品类市场份额领先，全球化布局。',
+    defaultGrowth:10, defaultWacc:9,
+  },
+};
+
+/* ─── 格式化 ─── */
+const fmt = {
+  price: n => n == null ? '—' : `¥${n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}`,
+  pct:   n => n == null ? '—' : `${n>=0?'+':''}${n.toFixed(2)}%`,
+  large: n => {
+    if (n == null) return '—';
+    const sign = n < 0 ? '-' : '';
+    const a = Math.abs(n);
+    if (a >= 1e12) return `${sign}¥${(a/1e12).toFixed(2)}万亿`;
+    if (a >= 1e8)  return `${sign}¥${(a/1e8).toFixed(2)}亿`;
+    if (a >= 1e4)  return `${sign}¥${(a/1e4).toFixed(0)}万`;
+    return `${sign}¥${a.toFixed(0)}`;
+  },
+  num: n => n == null ? '—' : n.toLocaleString('zh-CN'),
+};
+
+/* ─── DCF 计算 ─── */
+function calcDCF({ fcf, growthRate, terminalGrowth, wacc, years, sharesOut, netDebt }) {
+  const discount = wacc/100 - terminalGrowth/100;
+  let pvSum = 0, fcfCur = fcf;
+  const cashflows = [];
+  for (let t=1; t<=years; t++) {
+    fcfCur *= (1 + growthRate/100);
+    const pv = fcfCur / Math.pow(1+wacc/100, t);
+    pvSum += pv;
+    cashflows.push({ year:t, fcf:fcfCur, pv });
+  }
+  if (discount <= 0) return { pvSum, pvTerminal:0, terminalValue:0, enterpriseValue:pvSum, equityValue:pvSum-netDebt, intrinsicPrice:(pvSum-netDebt)/sharesOut, cashflows };
+  const terminalValue = fcfCur * (1+terminalGrowth/100) / discount;
+  const pvTerminal    = terminalValue / Math.pow(1+wacc/100, years);
+  const enterpriseValue = pvSum + pvTerminal;
+  const equityValue     = enterpriseValue - netDebt;
+  const intrinsicPrice  = equityValue / sharesOut;
+  return { pvSum, pvTerminal, terminalValue, enterpriseValue, equityValue, intrinsicPrice, cashflows };
+}
+
+/* ─── 子组件 ─── */
+function Badge({ children, color='blue' }) {
+  const c = { blue:'bg-blue-500/20 text-blue-300 border-blue-500/30', green:'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', red:'bg-red-500/20 text-red-300 border-red-500/30', amber:'bg-amber-500/20 text-amber-300 border-amber-500/30', purple:'bg-purple-500/20 text-purple-300 border-purple-500/30' };
+  return <span className={`px-2 py-0.5 text-xs font-medium rounded-full border ${c[color]||c.blue}`}>{children}</span>;
+}
+
+function StatCard({ label, value, sub, highlight }) {
+  return (
+    <div className={`glass rounded-xl p-4 card-hover ${highlight?'border-brand-500/40':''}`}>
+      <p className="text-slate-400 text-xs mb-1">{label}</p>
+      <p className={`font-semibold text-lg ${highlight?'text-brand-500':'text-white'}`}>{value}</p>
+      {sub && <p className="text-slate-500 text-xs mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+function Slider({ label, value, min, max, step, onChange, format }) {
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-sm">
+        <span className="text-slate-400">{label}</span>
+        <span className="text-white font-medium">{format?format(value):value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e=>onChange(Number(e.target.value))} className="w-full h-1.5 rounded-full cursor-pointer" />
+      <div className="flex justify-between text-xs text-slate-600">
+        <span>{format?format(min):min}</span><span>{format?format(max):max}</span>
+      </div>
+    </div>
+  );
+}
+
+function MeterBar({ label, value, max, color='bg-brand-500' }) {
+  const pct = Math.min(100, Math.max(0, (value/max)*100));
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-xs">
+        <span className="text-slate-400">{label}</span>
+        <span className="text-white">{fmt.large(value)}</span>
+      </div>
+      <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+        <div className={`h-full ${color} rounded-full transition-all duration-700`} style={{width:`${pct}%`}} />
+      </div>
+    </div>
+  );
+}
+
+/* ─── 主应用 ─── */
+function App() {
+  const [query, setQuery]             = useState('');
+  const [stock, setStock]             = useState(null);
+  const [loading, setLoading]         = useState(false);
+  const [error, setError]             = useState('');
+  const [activeTab, setActiveTab]     = useState('dcf');
+  const [apiStatus, setApiStatus]     = useState('unknown'); // 'live'|'offline'|'unknown'
+
+  const [years, setYears]                   = useState(10);
+  const [growthRate, setGrowthRate]         = useState(12);
+  const [terminalGrowth, setTerminalGrowth] = useState(3.5);
+  const [wacc, setWacc]                     = useState(9);
+  const [activeScenario, setActiveScenario] = useState('base');
+
+  // 启动时检测后端是否在线
+  useEffect(() => {
+    fetch(`${API}/health`, { signal: AbortSignal.timeout(3000) })
+      .then(r => r.ok ? setApiStatus('live') : setApiStatus('offline'))
+      .catch(() => setApiStatus('offline'));
+  }, []);
+
+  const applyScenario = useCallback((scenario, baseG) => {
+    setActiveScenario(scenario);
+    if (scenario === 'bull')      { setGrowthRate(baseG+5); setTerminalGrowth(4); setWacc(wacc-1.5); }
+    else if (scenario === 'bear') { setGrowthRate(Math.max(0,baseG-5)); setTerminalGrowth(2); setWacc(wacc+2); }
+    else                          { setGrowthRate(baseG); setTerminalGrowth(3.5); }
+  }, [wacc]);
+
+  const handleSearch = useCallback(async (tickerArg) => {
+    const raw = (tickerArg || query).trim().toUpperCase();
+    if (!raw) return;
+    const code = raw.replace(/\.(SH|SZ|BJ)$/i, '');
+    setError(''); setLoading(true); setActiveTab('dcf');
+
+    const preset = PRESETS[code];
+    if (!preset) {
+      setError(`暂不支持「${code}」，已收录：${Object.keys(PRESETS).join('、')}`);
+      setLoading(false); return;
+    }
+
+    // 立即展示预设数据
+    const base = { code, ...preset, dataSource:'preset', tradeDate:null };
+    setStock(base);
+    setGrowthRate(preset.defaultGrowth || 12);
+    setWacc(preset.defaultWacc || 9);
+    setTerminalGrowth(3.5);
+    setActiveScenario('base');
+    setLoading(false);
+
+    // 后台拉取实时行情（不阻塞展示）
+    try {
+      const res = await fetch(`${API}/api/stock/${code}`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const d = await res.json();
+        if (!d.error && d.price) {
+          setApiStatus('live');
+          setStock(prev => ({
+            ...prev,
+            price:     d.price,
+            preClose:  d.preClose,
+            change:    d.change,
+            changePct: d.changePct,
+            volume:    d.volume,
+            amount:    d.amount,
+            totalMv:   d.totalMv,
+            pe:        d.pe,
+            pb:        d.pb,
+            tradeDate: d.tradeDate,
+            name:      (d.name && d.name !== code) ? d.name : prev.name,
+            dataSource:'live',
+          }));
+        }
+      }
+    } catch (_) { setApiStatus('offline'); }
+  }, [query]);
+
+  const dcfResult = useMemo(() => {
+    if (!stock?.fcf) return null;
+    return calcDCF({ fcf:stock.fcf, growthRate, terminalGrowth, wacc, years,
+                     sharesOut:stock.sharesOut, netDebt:stock.netDebt });
+  }, [stock, growthRate, terminalGrowth, wacc, years]);
+
+  const upside = dcfResult ? ((dcfResult.intrinsicPrice - stock.price) / stock.price * 100) : 0;
+  const isUp = (stock?.changePct ?? 0) >= 0;
+
+  return (
+    <div className="min-h-screen text-white">
+      {/* 顶部导航 */}
+      <header className="border-b border-white/5 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-purple-500 flex items-center justify-center">
+            <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+          </div>
+          <span className="font-semibold text-lg">A股 DCF 估值</span>
+          <Badge color="blue">Beta</Badge>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded-full border ${apiStatus==='live' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : apiStatus==='offline' ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-slate-500/10 border-slate-500/30 text-slate-400'}`}>
+            <div className={`w-1.5 h-1.5 rounded-full ${apiStatus==='live'?'bg-emerald-400':apiStatus==='offline'?'bg-red-400':'bg-slate-400'}`} />
+            {apiStatus==='live' ? '实时数据' : apiStatus==='offline' ? '后端离线' : '检测中'}
+          </div>
+          <p className="text-slate-500 text-sm hidden md:block">Discounted Cash Flow</p>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+        {/* 搜索栏 */}
+        <div className="max-w-xl mx-auto">
+          <div className="relative">
+            <svg className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+            <input value={query}
+              onChange={e => { setQuery(e.target.value.toUpperCase()); setError(''); }}
+              onKeyDown={e => e.key==='Enter' && handleSearch()}
+              placeholder="输入A股代码，如 600519、300750..."
+              className="w-full bg-white/5 border border-white/10 rounded-2xl pl-12 pr-32 py-4 text-white placeholder-slate-500 focus:outline-none focus:border-brand-500/60 focus:ring-2 focus:ring-brand-500/20 transition-all text-base"
+            />
+            <button onClick={()=>handleSearch()} disabled={loading}
+              className="absolute right-2 top-1/2 -translate-y-1/2 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-white px-5 py-2 rounded-xl font-medium text-sm transition-colors flex items-center gap-2">
+              {loading && <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full spinner" />}
+              分析
+            </button>
+          </div>
+
+          {/* 快捷股票 */}
+          <div className="flex flex-wrap gap-2 mt-3 justify-center">
+            {Object.entries(PRESETS).map(([code, p]) => (
+              <button key={code} onClick={()=>{ setQuery(code); handleSearch(code); }}
+                className="px-3 py-1 text-xs text-slate-400 hover:text-white border border-white/10 hover:border-brand-500/50 rounded-lg transition-colors hover:bg-brand-500/10">
+                {code} <span className="text-slate-600">{p.name}</span>
+              </button>
+            ))}
+          </div>
+
+          {error && (
+            <div className="mt-3 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm text-center">{error}</div>
+          )}
+
+          {/* 后端离线提示 */}
+          {apiStatus==='offline' && (
+            <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400 text-xs text-center">
+              后端未启动，显示预设财务数据（股价为模拟值）。运行 <code className="bg-black/30 px-1 rounded">venv/bin/python app.py</code> 可获取实时行情。
+            </div>
+          )}
+        </div>
+
+        {/* 加载中 */}
+        {loading && (
+          <div className="flex justify-center py-16">
+            <div className="w-10 h-10 border-t-brand-500 rounded-full spinner" style={{border:'3px solid rgba(14,165,233,0.3)',borderTopColor:'#0ea5e9'}} />
+          </div>
+        )}
+
+        {/* 股票内容 */}
+        {!loading && stock && (
+          <div className="space-y-6 fade-in">
+            {/* 股票头部 */}
+            <div className="glass rounded-2xl p-6">
+              <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <h2 className="text-2xl font-bold">{stock.code}</h2>
+                    <span className="text-slate-400 text-lg">{stock.name}</span>
+                    <Badge color="blue">{stock.sector}</Badge>
+                    {stock.dataSource==='live'
+                      ? <Badge color="green">实时</Badge>
+                      : <Badge color="amber">预设</Badge>}
+                  </div>
+                  <p className="text-slate-400 text-sm max-w-lg">{stock.desc}</p>
+                  {stock.tradeDate && <p className="text-slate-600 text-xs">行情日期：{stock.tradeDate}</p>}
+                  {stock.warning && (
+                    <div className="flex items-center gap-2 text-amber-400 text-xs bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mt-1">
+                      <svg className="w-3.5 h-3.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd"/></svg>
+                      {stock.warning}
+                    </div>
+                  )}
+                </div>
+                <div className="text-right">
+                  <p className="text-4xl font-bold">{fmt.price(stock.price || stock.fcf/stock.sharesOut*15)}</p>
+                  {stock.changePct != null && (
+                    <div className={`flex items-center justify-end gap-2 mt-1 ${isUp?'text-emerald-400':'text-red-400'}`}>
+                      <svg className={`w-4 h-4 ${isUp?'':'rotate-180'}`} fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M5.293 7.707a1 1 0 010-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 01-1.414 1.414L11 5.414V17a1 1 0 11-2 0V5.414L6.707 7.707a1 1 0 01-1.414 0z" clipRule="evenodd"/>
+                      </svg>
+                      <span className="font-semibold">{fmt.price(Math.abs(stock.change||0))} ({fmt.pct(stock.changePct)})</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* 关键指标 */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <StatCard label="总市值" value={fmt.large(stock.totalMv || null)} sub="Market Cap" />
+              <StatCard label="市盈率 P/E" value={stock.pe ? stock.pe.toFixed(1) : '—'} sub="动态 PE" />
+              <StatCard label="市净率 P/B" value={stock.pb ? stock.pb.toFixed(2) : '—'} sub="P/B Ratio" />
+              <StatCard label="自由现金流" value={fmt.large(stock.fcf)} sub="预设 FCF" />
+            </div>
+
+            {/* Tab 导航 */}
+            <div className="flex gap-1 p-1 glass rounded-xl w-fit">
+              {[['dcf','DCF 估值模型'],['sensitivity','敏感性分析'],['breakdown','价值拆分']].map(([id,label])=>(
+                <button key={id} onClick={()=>setActiveTab(id)}
+                  className={`px-5 py-2 rounded-lg text-sm font-medium transition-all ${activeTab===id?'bg-brand-600 text-white shadow-lg':'text-slate-400 hover:text-white'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {/* ── DCF 估值面板 ── */}
+            {activeTab==='dcf' && dcfResult && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 fade-in">
+                {/* 左：参数 */}
+                <div className="glass rounded-2xl p-6 space-y-6">
+                  <h3 className="font-semibold text-slate-200 flex items-center gap-2">
+                    <svg className="w-4 h-4 text-brand-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                    </svg>
+                    DCF 参数设置
+                  </h3>
+
+                  {/* 情景预设 */}
+                  <div className="space-y-2">
+                    <p className="text-xs text-slate-500">情景预设</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        {id:'bear',label:'悲观',icon:'↓',desc:'低增速/高折现',color:'red'},
+                        {id:'base',label:'基准',icon:'→',desc:'默认参数',color:'blue'},
+                        {id:'bull',label:'乐观',icon:'↑',desc:'高增速/低折现',color:'green'},
+                      ].map(({id,label,icon,desc,color})=>{
+                        const cm = {
+                          red:   activeScenario===id?'bg-red-500/20 border-red-500/60 text-red-300':'border-white/10 text-slate-400 hover:border-red-500/40 hover:text-red-300',
+                          blue:  activeScenario===id?'bg-brand-500/20 border-brand-500/60 text-brand-300':'border-white/10 text-slate-400 hover:border-brand-500/40 hover:text-brand-300',
+                          green: activeScenario===id?'bg-emerald-500/20 border-emerald-500/60 text-emerald-300':'border-white/10 text-slate-400 hover:border-emerald-500/40 hover:text-emerald-300',
+                        };
+                        return (
+                          <button key={id} onClick={()=>applyScenario(id, stock.defaultGrowth||12)}
+                            className={`border rounded-lg p-2.5 text-center transition-all ${cm[color]}`}>
+                            <div className="text-base font-bold">{icon} {label}</div>
+                            <div className="text-xs opacity-70 mt-0.5">{desc}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <Slider label="预测年限" value={years} min={5} max={15} step={1} onChange={v=>{setYears(v);setActiveScenario('custom');}} format={v=>`${v} 年`} />
+                  <Slider label="FCF 增长率" value={growthRate} min={0} max={40} step={0.5} onChange={v=>{setGrowthRate(v);setActiveScenario('custom');}} format={v=>`${v}%`} />
+                  <Slider label="永续增长率" value={terminalGrowth} min={0} max={5} step={0.1} onChange={v=>{setTerminalGrowth(v);setActiveScenario('custom');}} format={v=>`${v}%`} />
+                  <Slider label="折现率 (WACC)" value={wacc} min={5} max={20} step={0.5} onChange={v=>{setWacc(v);setActiveScenario('custom');}} format={v=>`${v}%`} />
+
+                  <div className="pt-2 border-t border-white/5 space-y-2 text-sm">
+                    <div className="flex justify-between text-slate-400">
+                      <span>基础 FCF</span><span className="text-white">{fmt.large(stock.fcf)}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>净现金（净债务）</span>
+                      <span className={stock.netDebt<=0?'text-emerald-400':'text-red-400'}>
+                        {stock.netDebt<=0 ? '+' : ''}{fmt.large(-stock.netDebt)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>流通股数</span><span className="text-white">{(stock.sharesOut/1e8).toFixed(2)}亿股</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 右：结果 */}
+                <div className="space-y-4">
+                  <div className={`glass rounded-2xl p-6 border ${upside>=0?'border-emerald-500/30':'border-red-500/30'}`}>
+                    <p className="text-slate-400 text-sm mb-2">DCF 内在价值估算</p>
+                    <p className={`text-5xl font-bold mb-2 ${upside>=0?'text-emerald-400':'text-red-400'}`}>
+                      {fmt.price(dcfResult.intrinsicPrice)}
+                    </p>
+                    {stock.price && (
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <span className="text-slate-400 text-sm">当前股价 {fmt.price(stock.price)}</span>
+                        <Badge color={upside>=20?'green':upside>=0?'amber':'red'}>
+                          {upside>=0?'上涨空间':'高估'} {Math.abs(upside).toFixed(1)}%
+                        </Badge>
+                      </div>
+                    )}
+                    <div className="mt-4 h-2 bg-slate-700 rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full transition-all duration-700 ${upside>=20?'bg-emerald-500':upside>=0?'bg-amber-500':'bg-red-500'}`}
+                        style={{width:`${Math.min(100,Math.max(5,50+upside*0.5))}%`}} />
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-500 mt-1">
+                      <span>严重低估</span><span>合理估值</span><span>严重高估</span>
+                    </div>
+                  </div>
+
+                  <div className="glass rounded-2xl p-5 space-y-3">
+                    <h4 className="text-sm font-medium text-slate-300">企业价值拆分</h4>
+                    <MeterBar label={`FCF现值合计（${years}年）`} value={dcfResult.pvSum} max={dcfResult.enterpriseValue} color="bg-brand-500" />
+                    <MeterBar label="永续价值现值 (Terminal Value)" value={dcfResult.pvTerminal} max={dcfResult.enterpriseValue} color="bg-purple-500" />
+                    <div className="pt-2 border-t border-white/5 space-y-1.5 text-sm">
+                      <div className="flex justify-between"><span className="text-slate-400">企业价值 (EV)</span><span className="text-white font-medium">{fmt.large(dcfResult.enterpriseValue)}</span></div>
+                      <div className="flex justify-between"><span className="text-slate-400">股权价值</span><span className="text-white font-medium">{fmt.large(dcfResult.equityValue)}</span></div>
+                      <div className="flex justify-between"><span className="text-slate-400">永续价值占比</span><span className="text-amber-400 font-medium">{(dcfResult.pvTerminal/dcfResult.enterpriseValue*100).toFixed(0)}%</span></div>
+                    </div>
+                  </div>
+
+                  <div className={`rounded-xl p-4 text-sm ${upside>=25?'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300':upside>=0?'bg-amber-500/10 border border-amber-500/20 text-amber-300':'bg-red-500/10 border border-red-500/20 text-red-300'}`}>
+                    <strong>分析结论：</strong>
+                    {upside>=25 ? `以当前参数，${stock.name} 存在约 ${upside.toFixed(0)}% 安全边际，具有较高投资价值。`
+                    : upside>=0  ? `以当前参数，${stock.name} 接近合理估值，安全边际有限，需谨慎评估风险。`
+                    : `以当前参数，${stock.name} 市场定价高于内在价值约 ${Math.abs(upside).toFixed(0)}%，当前价格或已充分反映增长预期。`}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── 敏感性分析 Tab ── */}
+            {activeTab==='sensitivity' && dcfResult && (
+              <div className="space-y-6 fade-in">
+                <div className="glass rounded-2xl p-6">
+                  <h3 className="font-semibold text-slate-200 mb-1">敏感性分析矩阵</h3>
+                  <p className="text-slate-500 text-xs mb-4">内在价值（每股）随 WACC 与 FCF 增长率变化。绿色=低估，红色=高估。</p>
+                  {(()=>{
+                    const wRange = [-3,-2,-1,0,1,2,3].map(d=>+(wacc+d).toFixed(1)).filter(v=>v>0&&v<25);
+                    const gRange = [-6,-4,-2,0,2,4,6].map(d=>+(growthRate+d).toFixed(1)).filter(v=>v>=0&&v<=45);
+                    return (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs text-center border-collapse">
+                          <thead>
+                            <tr>
+                              <th className="p-2 text-slate-500 text-left font-normal w-20">WACC↓ / 增速→</th>
+                              {gRange.map(g=>(
+                                <th key={g} className={`p-2 font-medium ${+g===+growthRate?'text-brand-400':'text-slate-400'}`}>
+                                  {g}%{+g===+growthRate?' ★':''}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {wRange.map(w=>(
+                              <tr key={w}>
+                                <td className={`p-2 text-left font-medium ${+w===+wacc?'text-brand-400':'text-slate-400'}`}>
+                                  {w}%{+w===+wacc?' ★':''}
+                                </td>
+                                {gRange.map(g=>{
+                                  const r = calcDCF({fcf:stock.fcf,growthRate:g,terminalGrowth,wacc:w,years,sharesOut:stock.sharesOut,netDebt:stock.netDebt});
+                                  const ip = r.intrinsicPrice;
+                                  const diff = stock.price ? (ip-stock.price)/stock.price*100 : 0;
+                                  const isCur = +w===+wacc && +g===+growthRate;
+                                  let bg,txt;
+                                  if (diff>=30){bg='bg-emerald-500/30';txt='text-emerald-300';}
+                                  else if(diff>=10){bg='bg-emerald-500/15';txt='text-emerald-400';}
+                                  else if(diff>=0){bg='bg-amber-500/15';txt='text-amber-300';}
+                                  else if(diff>=-15){bg='bg-red-500/15';txt='text-red-400';}
+                                  else{bg='bg-red-500/30';txt='text-red-300';}
+                                  return (
+                                    <td key={g} className={`p-2 rounded ${bg} ${isCur?'ring-1 ring-brand-400':''}`}>
+                                      <span className={`font-medium ${txt}`}>{fmt.price(ip)}</span><br/>
+                                      {stock.price && <span className="text-slate-500">{diff>=0?'+':''}{diff.toFixed(0)}%</span>}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
+                  <div className="flex gap-4 mt-4 text-xs flex-wrap">
+                    {[['bg-emerald-500/30','低估 ≥30%'],['bg-emerald-500/15','低估 10-30%'],['bg-amber-500/15','低估 0-10%'],['bg-red-500/15','高估 0-15%'],['bg-red-500/30','高估 >15%']].map(([c,l])=>(
+                      <span key={l} className="flex items-center gap-1.5"><span className={`w-3 h-3 rounded ${c} inline-block`}/>{l}</span>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 三情景对比 */}
+                <div className="glass rounded-2xl p-6">
+                  <h3 className="font-semibold text-slate-200 mb-1">三情景估值对比</h3>
+                  <p className="text-slate-500 text-xs mb-4">悲观 / 基准 / 乐观假设下的内在价值。</p>
+                  {(()=>{
+                    const bg = stock.defaultGrowth || 12;
+                    const bw = stock.defaultWacc   || 9;
+                    const scenarios = [
+                      {label:'悲观',color:'red',   growth:Math.max(0,bg-5), tg:2,   w:bw+2},
+                      {label:'基准',color:'blue',  growth:bg,               tg:3.5, w:bw},
+                      {label:'乐观',color:'green', growth:bg+5,             tg:4,   w:Math.max(5,bw-1.5)},
+                    ];
+                    const cmap = {
+                      red:  {badge:'bg-red-500/20 text-red-300',   bar:'bg-red-500',     txt:'text-red-400'},
+                      blue: {badge:'bg-brand-500/20 text-brand-300',bar:'bg-brand-500',   txt:'text-brand-400'},
+                      green:{badge:'bg-emerald-500/20 text-emerald-300',bar:'bg-emerald-500',txt:'text-emerald-400'},
+                    };
+                    return (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        {scenarios.map(({label,color,growth,tg,w})=>{
+                          const r = calcDCF({fcf:stock.fcf,growthRate:growth,terminalGrowth:tg,wacc:w,years,sharesOut:stock.sharesOut,netDebt:stock.netDebt});
+                          const diff = stock.price?(r.intrinsicPrice-stock.price)/stock.price*100:0;
+                          const c = cmap[color];
+                          return (
+                            <div key={label} className={`rounded-xl p-4 border ${color==='red'?'border-red-500/20 bg-red-500/5':color==='green'?'border-emerald-500/20 bg-emerald-500/5':'border-brand-500/20 bg-brand-500/5'}`}>
+                              <div className="flex items-center justify-between mb-3">
+                                <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${c.badge}`}>{label}</span>
+                                {stock.price && <span className={`text-xs ${diff>=0?'text-emerald-400':'text-red-400'}`}>{diff>=0?'+':''}{diff.toFixed(1)}%</span>}
+                              </div>
+                              <p className={`text-2xl font-bold ${c.txt} mb-2`}>{fmt.price(r.intrinsicPrice)}</p>
+                              <div className="space-y-1 text-xs text-slate-400">
+                                <div className="flex justify-between"><span>增长率</span><span className="text-white">{growth}%</span></div>
+                                <div className="flex justify-between"><span>永续增长</span><span className="text-white">{tg}%</span></div>
+                                <div className="flex justify-between"><span>WACC</span><span className="text-white">{w}%</span></div>
+                                <div className="flex justify-between"><span>TV占比</span><span className="text-white">{r.enterpriseValue?(r.pvTerminal/r.enterpriseValue*100).toFixed(0):0}%</span></div>
+                              </div>
+                              <div className="mt-3 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                                <div className={`h-full ${c.bar} rounded-full`} style={{width:`${Math.min(100,Math.max(5,50+diff*0.4))}%`}} />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
+            {/* ── 价值拆分 Tab ── */}
+            {activeTab==='breakdown' && dcfResult && (
+              <div className="glass rounded-2xl p-6 fade-in">
+                <h3 className="font-semibold text-slate-200 mb-4">逐年现金流现值明细</h3>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b border-white/10">
+                        <th className="pb-3 text-slate-400 font-medium">年份</th>
+                        <th className="pb-3 text-slate-400 font-medium text-right">预测 FCF</th>
+                        <th className="pb-3 text-slate-400 font-medium text-right">现值 (PV)</th>
+                        <th className="pb-3 text-slate-400 font-medium text-right">折现系数</th>
+                        <th className="pb-3 text-slate-400 font-medium w-32">占比</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dcfResult.cashflows.map(({year,fcf,pv})=>{
+                        const pct = pv/dcfResult.enterpriseValue*100;
+                        return (
+                          <tr key={year} className="border-b border-white/5 hover:bg-white/[0.02]">
+                            <td className="py-2.5 text-white">第 {year} 年</td>
+                            <td className="py-2.5 text-right text-slate-300">{fmt.large(fcf)}</td>
+                            <td className="py-2.5 text-right text-brand-400 font-medium">{fmt.large(pv)}</td>
+                            <td className="py-2.5 text-right text-slate-500">{(1/Math.pow(1+wacc/100,year)*100).toFixed(1)}%</td>
+                            <td className="py-2.5">
+                              <div className="flex items-center gap-2">
+                                <div className="flex-1 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                                  <div className="h-full bg-brand-500 rounded-full" style={{width:`${Math.min(100,pct*3)}%`}} />
+                                </div>
+                                <span className="text-xs text-slate-500 w-10 text-right">{pct.toFixed(1)}%</span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      <tr className="bg-purple-500/5">
+                        <td className="py-2.5 text-purple-300 font-medium">永续价值</td>
+                        <td className="py-2.5 text-right text-slate-300">{fmt.large(dcfResult.terminalValue)}</td>
+                        <td className="py-2.5 text-right text-purple-400 font-medium">{fmt.large(dcfResult.pvTerminal)}</td>
+                        <td className="py-2.5 text-right text-slate-500">{(1/Math.pow(1+wacc/100,years)*100).toFixed(1)}%</td>
+                        <td className="py-2.5">
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                              <div className="h-full bg-purple-500 rounded-full" style={{width:`${Math.min(100,dcfResult.pvTerminal/dcfResult.enterpriseValue*100*1.5)}%`}} />
+                            </div>
+                            <span className="text-xs text-slate-500 w-10 text-right">{(dcfResult.pvTerminal/dcfResult.enterpriseValue*100).toFixed(1)}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t border-white/10">
+                        <td className="pt-3 text-white font-semibold">合计</td>
+                        <td />
+                        <td className="pt-3 text-right text-white font-semibold">{fmt.large(dcfResult.enterpriseValue)}</td>
+                        <td />
+                        <td className="pt-3 text-right text-xs text-slate-400">企业价值 (EV)</td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 空状态 */}
+        {!loading && !stock && !error && (
+          <div className="text-center py-20 space-y-4">
+            <div className="w-16 h-16 mx-auto rounded-2xl bg-white/5 flex items-center justify-center">
+              <svg className="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
+              </svg>
+            </div>
+            <p className="text-slate-400 text-lg">输入A股代码开始分析</p>
+            <p className="text-slate-600 text-sm">支持：贵州茅台(600519)、宁德时代(300750)、比亚迪(002594) 等</p>
+          </div>
+        )}
+      </main>
+
+      <footer className="border-t border-white/5 px-6 py-4 text-center">
+        <p className="text-slate-600 text-xs">财报数据为预设估算值，DCF 基于假设参数，不构成投资建议。实际投资请参考专业机构报告。</p>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
